@@ -18,10 +18,12 @@ const (
 	ReasonNoPendingOTP   RejectReason = "no_pending_otp"  // 没有待校验的动态码
 
 	// 会话与令牌相关
-	ReasonTokenExpired   RejectReason = "token_expired"   // 访问令牌过期
-	ReasonTokenUnknown   RejectReason = "token_unknown"   // 令牌不存在
-	ReasonSessionRevoked RejectReason = "session_revoked" // 会话族已被撤销
-	ReasonRefreshReused  RejectReason = "refresh_reused"  // 旧刷新令牌被重放，会话族被撤销并标记可疑
+	ReasonTokenExpired      RejectReason = "token_expired"      // 访问令牌过期
+	ReasonTokenUnknown      RejectReason = "token_unknown"      // 令牌不存在
+	ReasonSessionRevoked    RejectReason = "session_revoked"    // 会话族已被撤销（重放检测）
+	ReasonRefreshReused     RejectReason = "refresh_reused"     // 旧刷新令牌被重放，会话族被撤销并标记可疑
+	ReasonSessionTerminated RejectReason = "session_terminated" // 用户主动结束了该会话
+	ReasonSessionEvicted    RejectReason = "session_evicted"    // 超出账号会话容量上限，被自动回收
 
 	// 限流与授权相关
 	ReasonRateLimited RejectReason = "rate_limited" // 触发限流

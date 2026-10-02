@@ -84,7 +84,7 @@ func TestGatewayAccessEndToEnd(t *testing.T) {
 	res := g.Login("alice", "web", "pw123")
 	t.Logf("登录第一步 -> %+v", res)
 	code := otp.records["alice"].Code
-	res, pair := g.VerifyOTP("alice", code)
+	res, pair := g.VerifyOTP("alice", "web", code)
 	t.Logf("登录第二步 -> %+v", res)
 	if !res.Allowed {
 		t.Fatalf("登录应成功, got %v", res.Reason)
