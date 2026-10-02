@@ -12,7 +12,7 @@ gateway/            核心库
   types.go          统一判定结果 Result 与可区分的拒绝原因 RejectReason
   otp.go            一次性动态码签发与校验（OTPStore）
   login.go          密码 + 多因素认证与失败锁定（Authenticator）
-  session.go        会话族、令牌轮换与重放检测（SessionManager）
+  session.go        会话族、令牌轮换、重放检测、会话总览/结束/容量回收/活动记录（SessionManager）
   ratelimit.go      按 账号+来源 的固定窗口限流（RateLimiter）
   authz.go          角色+场景授权与判定历史（Authorizer）
   gateway.go        组合以上组件的完整请求链路（Gateway）
@@ -24,8 +24,8 @@ cmd/gateway/        本地演示程序
 1. `Gateway.Login(account, source, password)`：先过限流，再校验账号密码。
    密码通过后为该账号签发一个一次性动态码（本地模拟，用
    `OTPStore.LastCode` 取回，真实场景相当于短信下发）。
-2. `Gateway.VerifyOTP(account, code)`：校验动态码，通过后建立会话族并
-   签发首对令牌。
+2. `Gateway.VerifyOTP(account, source, code)`：校验动态码，通过后建立会话族并
+   签发首对令牌，`source` 记录登录入口（web/mobile/...），用于会话总览。
 
 动态码校验按 **是否存在 → 是否已用 → 是否过期 → 是否匹配** 的顺序判定，
 拒绝原因可区分：
@@ -55,6 +55,53 @@ cmd/gateway/        本地演示程序
 - **并发安全**：判定与轮换在同一把互斥锁内完成，N 个请求并发刷新同一会话
   时只有一个能成功，其余被拒绝，不会错误放行。
 
+## 会话自助管理与集中结束
+
+- `Gateway.ListSessions(account)`：会话总览，返回账号当前全部**活跃**会话，
+  每项含登录入口（`Source`）、建立时间（`CreatedAt`）、最近一次使用时间
+  （`LastActiveAt`，刷新轮换与访问资源都会刷新它）、可疑标记（`Suspicious`），
+  按建立时间升序，结果稳定。
+- `Gateway.EndSession(account, sessionID)`：结束名下某个会话。被结束会话的
+  访问/刷新令牌**立即失效**，拒绝原因为 `session_ended_by_user`，与
+  `session_evicted`（容量回收）、`session_revoked`（重放撤销）可区分。
+  结束操作**幂等**，通过 `EndOutcome` 区分且不会出错：
+  - `ended_now`：本次操作将会话结束；
+  - `already_ended`：会话此前已结束（结果中带原终止方式），重复结束无副作用；
+  - `not_found`：会话不存在或不属于该账号（不跨账号泄露存在性）。
+- `Gateway.EndOtherSessions(account, currentAccessToken)`：一键结束除当前
+  访问令牌所属会话之外的全部会话，返回实际结束数；重复调用稳定返回 0。
+
+## 账号级会话容量与自动回收
+
+- `SessionManager.SetMaxSessions(n)` 设置每账号活跃会话上限（0 表示不限），
+  只影响之后的签发，不回溯回收存量会话。
+- 登录使活跃会话数超上限时，按**最近最久未使用**规则回收：`LastActiveAt`
+  最小者优先，并列时建立早者优先，再并列按会话 ID 保证确定性——规则用户
+  可预期、事后可解释。
+- 被回收会话的令牌立即失效，拒绝原因 `session_evicted`，与用户主动结束
+  （`session_ended_by_user`）明确区分。
+- **并发自洽**：签发、结束、刷新、回收全部在同一把互斥锁内完成。任意并发
+  组合下，活跃会话数不超过上限，已失效会话不会被放行，存活会话不被误伤
+  （有并发测试覆盖）。
+
+## 会话活动记录与追溯
+
+`Gateway.SessionEvents(account)` 按时间升序返回账号的会话活动记录，覆盖
+关键动作：`issued`（建立）、`rotated`（轮换）、`ended_by_user`（主动结束）、
+`evicted`（容量回收）、`marked_suspicious`（重放撤销）。每条记录含：
+
+- `Detail`：当时的判定依据（如"超过上限 1，按最近最久未使用规则回收"）；
+- **配置快照**：`MaxSessions` / `AccessTTL` / `RefreshTTL` 记录事件发生时的
+  配置值。之后调整配置，历史记录仍按当时规则解释，不会对不上。
+
+## 与旧行为的兼容范围
+
+原有语义全部保留并有测试守护：正常轮换、宽限期内并发重复刷新只拒绝不撤销、
+宽限期外重放撤销会话族并标记可疑、未知/过期/已撤销令牌原因可区分、登录与
+动态码失败锁定、限流边界、授权判定历史。新增能力只是在原 `revoked` 语义上
+细分了终止方式（`session_ended_by_user` / `session_evicted` / 原
+`session_revoked`），不改变原有拒绝原因的判定路径。
+
 ## 限流与授权规则
 
 **限流**：按 `(账号, 来源)` 做固定窗口计数，每个窗口最多放行 `limit` 次，
@@ -78,13 +125,15 @@ cmd/gateway/        本地演示程序
 ## 本地验证
 
 ```bash
-# 全部单元测试（含验证码重放、会话并发刷新、限流边界、越权访问）
+# 全部单元测试（含验证码重放、会话并发刷新、限流边界、越权访问、
+# 会话总览与集中结束、并发容量回收、结束后凭证失效）
 go test ./... -v        # 日志中打印关键输入与判定依据
 
 # 并发竞态检查
 go test -race ./...
 
 # 端到端演示：登录 -> 多因素 -> 授权 -> 刷新 -> 重放检测
+#            -> 会话总览/集中结束 -> 容量回收 -> 活动记录
 go run ./cmd/gateway
 ```
 

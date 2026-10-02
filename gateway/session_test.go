@@ -9,7 +9,7 @@ import (
 func TestConcurrentRefreshOnlyOneSucceeds(t *testing.T) {
 	clock := newFakeClock()
 	sm := NewSessionManager(time.Minute, time.Hour, clock.Now)
-	pair := sm.Issue("alice")
+	pair := sm.Issue("alice", "test")
 	t.Logf("输入: 初始刷新令牌 %s，并发 %d 个请求同时刷新", pair.RefreshToken, 16)
 
 	const n = 16
@@ -44,7 +44,7 @@ func TestConcurrentRefreshOnlyOneSucceeds(t *testing.T) {
 func TestRefreshTokenReplayRevokesFamily(t *testing.T) {
 	clock := newFakeClock()
 	sm := NewSessionManager(time.Minute, time.Hour, clock.Now)
-	pair := sm.Issue("alice")
+	pair := sm.Issue("alice", "test")
 	oldRefresh := pair.RefreshToken
 
 	res, pair2 := sm.Refresh(oldRefresh)
@@ -80,7 +80,7 @@ func TestRefreshTokenReplayRevokesFamily(t *testing.T) {
 func TestAccessTokenExpiry(t *testing.T) {
 	clock := newFakeClock()
 	sm := NewSessionManager(time.Minute, time.Hour, clock.Now)
-	pair := sm.Issue("alice")
+	pair := sm.Issue("alice", "test")
 
 	res, account := sm.ValidateAccess(pair.AccessToken)
 	t.Logf("有效期内访问令牌 -> 判定: %+v account=%s", res, account)

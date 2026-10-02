@@ -21,13 +21,37 @@ func (g *Gateway) Login(account, source, password string) Result {
 	return g.Auth.Login(account, password)
 }
 
-// VerifyOTP 登录第二步：动态码通过后建立会话并签发首对令牌。
-func (g *Gateway) VerifyOTP(account, code string) (Result, TokenPair) {
+// VerifyOTP 登录第二步：动态码通过后建立会话并签发首对令牌，source 记录登录入口。
+func (g *Gateway) VerifyOTP(account, source, code string) (Result, TokenPair) {
 	res, _ := g.Auth.VerifyOTP(account, code)
 	if !res.Allowed {
 		return res, TokenPair{}
 	}
-	return res, g.Sessions.Issue(account)
+	return res, g.Sessions.Issue(account, source)
+}
+
+// ListSessions 返回账号当前的全部活跃会话（会话总览）。
+func (g *Gateway) ListSessions(account string) []SessionInfo {
+	return g.Sessions.ListSessions(account)
+}
+
+// EndSession 用户主动结束名下某个会话，幂等且结果可区分。
+func (g *Gateway) EndSession(account, sessionID string) (Result, EndOutcome) {
+	return g.Sessions.EndSession(account, sessionID)
+}
+
+// EndOtherSessions 结束账号名下除当前访问令牌所属会话之外的全部会话，
+// 返回实际结束的会话数。
+func (g *Gateway) EndOtherSessions(account, currentAccessToken string) (Result, int) {
+	keep, _ := g.Sessions.FamilyIDOf(currentAccessToken)
+	n := g.Sessions.EndOtherSessions(account, keep)
+	return Allow("已结束除当前会话外的其他会话"), n
+}
+
+// SessionEvents 返回账号的会话活动记录（建立/轮换/结束/回收/可疑），
+// 每条记录带判定依据与当时的配置快照。
+func (g *Gateway) SessionEvents(account string) []SessionEvent {
+	return g.Sessions.Events(account)
 }
 
 // Access 一次资源访问的完整链路：限流 -> 访问令牌校验 -> 授权判定。
