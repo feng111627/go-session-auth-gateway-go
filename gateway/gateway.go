@@ -40,12 +40,11 @@ func (g *Gateway) EndSession(account, sessionID string) (Result, EndOutcome) {
 	return g.Sessions.EndSession(account, sessionID)
 }
 
-// EndOtherSessions 结束账号名下除当前访问令牌所属会话之外的全部会话，
-// 返回实际结束的会话数。
+// EndOtherSessions 结束账号名下除当前访问令牌所属会话之外的全部会话。
+// 访问令牌缺失、无效、过期或不属于该账号时直接拒绝，一个会话都不结束；
+// 凭证有效时只结束其余会话，当前正在使用的会话保持可用。
 func (g *Gateway) EndOtherSessions(account, currentAccessToken string) (Result, int) {
-	keep, _ := g.Sessions.FamilyIDOf(currentAccessToken)
-	n := g.Sessions.EndOtherSessions(account, keep)
-	return Allow("已结束除当前会话外的其他会话"), n
+	return g.Sessions.EndOtherSessionsWithToken(account, currentAccessToken)
 }
 
 // SessionEvents 返回账号的会话活动记录（建立/轮换/结束/回收/可疑），
