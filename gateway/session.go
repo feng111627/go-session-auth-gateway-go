@@ -74,6 +74,7 @@ type sessionFamily struct {
 	id             string
 	account        string
 	source         string    // 登录入口
+	seq            uint64    // 建立顺序号（单调递增），时间戳并列时的确定性决胜依据
 	createdAt      time.Time // 建立时间
 	lastActiveAt   time.Time // 最近一次使用时间（刷新或访问）
 	currentRefresh string
@@ -96,7 +97,8 @@ type accessRecord struct {
 // 使用"上一个"令牌且在宽限期内（并发重复刷新）-> 拒绝但不撤销；
 // 使用更旧的令牌或宽限期外的旧令牌 -> 撤销整个会话族并标记可疑。
 // 容量语义：同一账号活跃会话数超过 maxSessions 时，按"最近最久未使用"
-// （lastActiveAt 最小者优先，并列时建立早者优先）回收旧会话。
+// （lastActiveAt 最小者优先，并列时建立早者优先，再并列按建立顺序号）回收旧
+// 会话；本次刚建立的会话受保护，绝不会被自己的这次登录回收。
 type SessionManager struct {
 	mu           sync.Mutex
 	accessTTL    time.Duration
@@ -104,6 +106,7 @@ type SessionManager struct {
 	leeway       time.Duration // 并发重复刷新宽限期
 	maxSessions  int           // 每账号活跃会话上限，0 表示不限
 	clock        Clock
+	nextSeq      uint64                    // 下一个会话族建立顺序号
 	families     map[string]*sessionFamily // familyID -> 会话族
 	refreshIndex map[string]string         // 所有签发过的刷新令牌 -> familyID
 	accessIndex  map[string]accessRecord   // 访问令牌 -> 记录
@@ -135,20 +138,22 @@ func (m *SessionManager) SetMaxSessions(n int) {
 }
 
 // Issue 为账号建立新会话族并签发首对令牌，source 记录登录入口。
-// 建立后按容量规则回收该账号最久未使用的旧会话。
+// 建立后按容量规则回收该账号最久未使用的旧会话；本次新建的会话受保护，
+// 任何情况下都不会被本次回收选中。
 func (m *SessionManager) Issue(account, source string) TokenPair {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.clock()
+	m.nextSeq++
 	fam := &sessionFamily{
 		id: newToken(), account: account, source: source,
-		createdAt: now, lastActiveAt: now,
+		seq: m.nextSeq, createdAt: now, lastActiveAt: now,
 	}
 	m.families[fam.id] = fam
 	pair := m.rotateLocked(fam)
 	m.recordLocked(fam, EventIssued,
 		fmt.Sprintf("账号 %s 从入口 %q 登录建立会话", account, source))
-	m.enforceCapacityLocked(account)
+	m.enforceCapacityLocked(account, fam.id)
 	return pair
 }
 
@@ -247,10 +252,12 @@ func (m *SessionManager) ListSessions(account string) []SessionInfo {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []SessionInfo
+	seqOf := map[string]uint64{}
 	for _, fam := range m.families {
 		if fam.account != account || fam.revoked {
 			continue
 		}
+		seqOf[fam.id] = fam.seq
 		out = append(out, SessionInfo{
 			ID: fam.id, Account: fam.account, Source: fam.source,
 			CreatedAt: fam.createdAt, LastActiveAt: fam.lastActiveAt,
@@ -261,7 +268,7 @@ func (m *SessionManager) ListSessions(account string) []SessionInfo {
 		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
 			return out[i].CreatedAt.Before(out[j].CreatedAt)
 		}
-		return out[i].ID < out[j].ID
+		return seqOf[out[i].ID] < seqOf[out[j].ID]
 	})
 	return out
 }
@@ -320,6 +327,36 @@ func (m *SessionManager) FamilyIDOf(accessToken string) (string, bool) {
 	return rec.familyID, true
 }
 
+// LocateCurrent 校验"当前会话"的访问凭证并返回其所属会话族 ID，
+// 供"一键结束其他会话"定位要保留的会话。凭证有问题时拒绝，且调用方
+// 不得结束任何会话：
+//   - 凭证缺失/不存在 -> token_unknown；
+//   - 凭证不属于该账号 -> forbidden（不结束任何会话，也不泄露对方会话）；
+//   - 会话已结束/回收/撤销 -> 对应的终止原因；
+//   - 凭证已过期 -> token_expired。
+func (m *SessionManager) LocateCurrent(account, accessToken string) (string, Result) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if accessToken == "" {
+		return "", Reject(ReasonTokenUnknown, "缺少访问凭证，无法定位当前会话，未结束任何会话")
+	}
+	rec, ok := m.accessIndex[accessToken]
+	if !ok {
+		return "", Reject(ReasonTokenUnknown, "访问凭证不存在，无法定位当前会话，未结束任何会话")
+	}
+	fam := m.families[rec.familyID]
+	if fam.account != account {
+		return "", Reject(ReasonForbidden, "访问凭证不属于该账号，未结束任何会话")
+	}
+	if fam.revoked {
+		return "", m.rejectForFamilyLocked(fam)
+	}
+	if !m.clock().Before(rec.expiresAt) {
+		return "", Reject(ReasonTokenExpired, "访问凭证已过期，无法定位当前会话，未结束任何会话")
+	}
+	return fam.id, Allow("访问凭证有效，已定位当前会话")
+}
+
 // Events 返回账号的会话活动记录（只读副本，按时间升序）。
 // 每条记录带有当时的配置快照，配置变更后历史仍可解释。
 func (m *SessionManager) Events(account string) []SessionEvent {
@@ -346,8 +383,16 @@ func (m *SessionManager) IsSuspicious(refreshToken string) bool {
 }
 
 // enforceCapacityLocked 回收账号超额的活跃会话：最近最久未使用者优先被回收。
+// protectID 是本次刚建立的会话，任何情况下都不会被选中——保证"到上限后再登录，
+// 清的一定是旧会话，刚登录的会话一定可用"。
+// 决胜顺序（全部确定性、可解释，不依赖随机 ID）：
+//  1. lastActiveAt 小者（最久未使用）优先回收；
+//  2. 并列时 createdAt 早者优先；
+//  3. 再并列时建立顺序号 seq 小者（先建立的）优先——同一时刻/并发登录下
+//     顺序号单调递增，因此回收顺序稳定，且新建的会话序号最大、最不容易被选中。
+//
 // 调用方须持有 m.mu。
-func (m *SessionManager) enforceCapacityLocked(account string) {
+func (m *SessionManager) enforceCapacityLocked(account, protectID string) {
 	if m.maxSessions <= 0 {
 		return
 	}
@@ -360,7 +405,6 @@ func (m *SessionManager) enforceCapacityLocked(account string) {
 	if len(active) <= m.maxSessions {
 		return
 	}
-	// 最近最久未使用优先回收；并列时建立早者优先；再并列按 ID 保证确定性
 	sort.Slice(active, func(i, j int) bool {
 		if !active[i].lastActiveAt.Equal(active[j].lastActiveAt) {
 			return active[i].lastActiveAt.Before(active[j].lastActiveAt)
@@ -368,14 +412,22 @@ func (m *SessionManager) enforceCapacityLocked(account string) {
 		if !active[i].createdAt.Equal(active[j].createdAt) {
 			return active[i].createdAt.Before(active[j].createdAt)
 		}
-		return active[i].id < active[j].id
+		return active[i].seq < active[j].seq
 	})
-	for _, fam := range active[:len(active)-m.maxSessions] {
+	need := len(active) - m.maxSessions
+	for _, fam := range active {
+		if need == 0 {
+			break
+		}
+		if fam.id == protectID {
+			continue // 刚建立的会话受保护，跳过它选下一个最旧的
+		}
 		fam.revoked = true
 		fam.endKind = EndEvicted
 		m.recordLocked(fam, EventEvicted,
-			fmt.Sprintf("账号活跃会话数超过上限 %d，按最近最久未使用规则回收（该会话最近活动于 %s）",
-				m.maxSessions, fam.lastActiveAt.Format(time.RFC3339)))
+			fmt.Sprintf("账号活跃会话数超过上限 %d，按最近最久未使用规则回收（该会话最近活动于 %s，建立顺序号 %d）",
+				m.maxSessions, fam.lastActiveAt.Format(time.RFC3339), fam.seq))
+		need--
 	}
 }
 

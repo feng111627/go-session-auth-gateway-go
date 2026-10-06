@@ -1,5 +1,7 @@
 package gateway
 
+import "fmt"
+
 // Gateway 组合限流、认证、会话与授权，对外提供完整请求链路。
 type Gateway struct {
 	Limiter  *RateLimiter
@@ -41,11 +43,16 @@ func (g *Gateway) EndSession(account, sessionID string) (Result, EndOutcome) {
 }
 
 // EndOtherSessions 结束账号名下除当前访问令牌所属会话之外的全部会话，
-// 返回实际结束的会话数。
+// 返回实际结束的会话数。定位"当前会话"的访问凭证必须有效：凭证缺失、
+// 不存在、过期、所属会话已终止或不属于该账号时，直接拒绝且一个会话都不
+// 结束（避免误把当前会话一起踢下线）。
 func (g *Gateway) EndOtherSessions(account, currentAccessToken string) (Result, int) {
-	keep, _ := g.Sessions.FamilyIDOf(currentAccessToken)
+	keep, res := g.Sessions.LocateCurrent(account, currentAccessToken)
+	if !res.Allowed {
+		return res, 0
+	}
 	n := g.Sessions.EndOtherSessions(account, keep)
-	return Allow("已结束除当前会话外的其他会话"), n
+	return Allow(fmt.Sprintf("已结束除当前会话外的其他 %d 个会话，当前会话保持可用", n)), n
 }
 
 // SessionEvents 返回账号的会话活动记录（建立/轮换/结束/回收/可疑），

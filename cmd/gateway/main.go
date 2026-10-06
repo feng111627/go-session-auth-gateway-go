@@ -75,6 +75,11 @@ func main() {
 	for _, s := range g.ListSessions("alice") {
 		fmt.Printf("  剩余会话 %s: 入口=%s\n", s.ID[:8], s.Source)
 	}
+	// 用无效凭证一键结束：直接拒绝，一个会话都不结束
+	res, n = g.EndOtherSessions("alice", "not-a-valid-token")
+	fmt.Println("用无效凭证一键结束:", res.Reason, "-", res.Detail, " 结束数 =", n)
+	res, n = g.EndOtherSessions("alice", pairM.AccessToken) // pairM 所属会话已结束
+	fmt.Println("用已结束会话的凭证一键结束:", res.Reason, "-", res.Detail, " 结束数 =", n)
 
 	fmt.Println("\n== 5. 账号会话容量与自动回收 ==")
 	g.Sessions.SetMaxSessions(1)
